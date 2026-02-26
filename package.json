@@ -1,12 +1,17 @@
 {
   "name": "tapnow-studio",
   "private": true,
-  "version": "3.8.7",
+  "version": "3.8.8-rc6",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build && node scripts/copy-versioned-build.cjs",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:k87": "node scripts/k87_feature_tests.cjs",
+    "test:storyboard-parser": "node scripts/storyboard_project_parser_regression.cjs",
+    "test:storyboard-roundtrip": "node scripts/storyboard_save_load_roundtrip_regression.cjs",
+    "test:smoke-playwright": "node scripts/smoke_playwright_fallback.cjs",
+    "test:release:gates": "npm run test:k87 && npm run test:storyboard-parser && npm run test:storyboard-roundtrip"
   },
   "dependencies": {
     "dompurify": "^3.0.8",
@@ -25,10 +30,10 @@
     "@types/react-dom": "^18.2.19",
     "@vitejs/plugin-react": "^4.2.1",
     "autoprefixer": "^10.4.18",
+    "playwright-core": "^1.58.2",
     "postcss": "^8.4.35",
     "tailwindcss": "^3.4.1",
     "vite": "^5.1.4",
     "vite-plugin-singlefile": "^2.0.1"
   }
 }
-

@@ -2135,6 +2135,31 @@ const parseStoryboardSourceNodeId = (sourceNodeId) => {
     return { nodeId, shotId, isImageMode };
 };
 const ASYNC_CONFIG_TEMPLATE_TEXT = JSON.stringify(ASYNC_CONFIG_TEMPLATE, null, 2);
+const REQUEST_CHAIN_TEMPLATE = {
+    enabled: false,
+    steps: [
+        {
+            id: 'upload_file',
+            type: 'http',
+            onError: 'stop',
+            request: {
+                endpoint: '/v1/files',
+                method: 'POST',
+                bodyType: 'multipart',
+                headers: {},
+                query: {},
+                files: {
+                    file: '{{fileBlob1:blob}}'
+                },
+                body: {}
+            },
+            extract: {
+                uploadedFileId: 'id'
+            }
+        }
+    ]
+};
+const REQUEST_CHAIN_TEMPLATE_TEXT = JSON.stringify(REQUEST_CHAIN_TEMPLATE, null, 2);
 const buildEmptyAsyncConfig = () => ({
     enabled: false,
     requestIdPaths: ['requestId', 'request_id'],
@@ -2170,6 +2195,17 @@ const IMAGE_NATIVE_MULTI_IMAGE_MODE_FORCE = 'force_native';
 const IMAGE_NATIVE_MULTI_IMAGE_MODE_DISABLE = 'disable_native';
 const NATIVE_MULTI_IMAGE_CAPABILITY_STORAGE_KEY = 'tapnow_native_multi_image_capabilities';
 const NODE_IO_ENVELOPE_VERSION = '1.0';
+const TRANSPORT_HTTP_JSON = 'http-json';
+const TRANSPORT_HTTP_SSE = 'http-sse';
+const TRANSPORT_WS_STREAM = 'ws-stream';
+const DEFAULT_TRANSPORT_OPTIONS = Object.freeze({
+    sseDataPrefix: 'data:',
+    sseDoneToken: '[DONE]',
+    sseDeltaPath: '',
+    sseDelimiter: '\n\n',
+    wsMessagePath: '',
+    wsDoneToken: '[DONE]'
+});
 
 const DEFAULT_MODEL_LIBRARY = [
     ...DEFAULT_API_CONFIGS
@@ -2201,7 +2237,11 @@ const DEFAULT_MODEL_LIBRARY = [
                 supportsHD,
                 apiType: DEFAULT_PROVIDERS[config.provider]?.apiType || 'openai',
                 customParams: [],
-                asyncConfig: null
+                asyncConfig: null,
+                requestChain: null,
+                transport: TRANSPORT_HTTP_JSON,
+                transportOptions: { ...DEFAULT_TRANSPORT_OPTIONS },
+                capabilities: buildDefaultCapabilitySchema(config.type || 'Chat')
             };
             return ({
                 ...entryBase,
@@ -2759,7 +2799,7 @@ function getDefaultRequestTemplateForType(type) {
     } else if (modelType === 'Chat' || modelType === 'ChatImage') {
         body = {
             model: '{{modelName}}',
-            messages: [{ role: 'user', content: '{{prompt}}' }],
+            messages: '{{messages}}',
             stream: false
         };
     } else {
@@ -3091,6 +3131,95 @@ const normalizeRequestTemplate = (template) => {
     };
     return normalized;
 };
+const normalizeTransportMode = (transport) => {
+    const raw = String(transport || '').trim().toLowerCase();
+    if (raw === TRANSPORT_HTTP_SSE || raw === 'sse' || raw === 'http_sse') return TRANSPORT_HTTP_SSE;
+    if (raw === TRANSPORT_WS_STREAM || raw === 'ws' || raw === 'websocket' || raw === 'ws_stream') return TRANSPORT_WS_STREAM;
+    return TRANSPORT_HTTP_JSON;
+};
+const normalizeTransportOptions = (options) => {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+        return { ...DEFAULT_TRANSPORT_OPTIONS };
+    }
+    return {
+        sseDataPrefix: String(options.sseDataPrefix || DEFAULT_TRANSPORT_OPTIONS.sseDataPrefix),
+        sseDoneToken: String(options.sseDoneToken || DEFAULT_TRANSPORT_OPTIONS.sseDoneToken),
+        sseDeltaPath: String(options.sseDeltaPath || ''),
+        sseDelimiter: String(options.sseDelimiter || DEFAULT_TRANSPORT_OPTIONS.sseDelimiter),
+        wsMessagePath: String(options.wsMessagePath || ''),
+        wsDoneToken: String(options.wsDoneToken || DEFAULT_TRANSPORT_OPTIONS.wsDoneToken)
+    };
+};
+function buildDefaultCapabilitySchema(type) {
+    const modelType = String(type || 'Chat');
+    const isChat = modelType === 'Chat' || modelType === 'ChatImage';
+    const isMedia = modelType === 'Image' || modelType === 'Video' || modelType === 'ChatImage';
+    return {
+        supportsMultipart: isMedia,
+        supportsRequestChain: false,
+        supportsSSE: false,
+        supportsWS: false,
+        supportsTools: isChat
+    };
+}
+const normalizeCapabilitySchema = (capabilities, type) => {
+    const defaults = buildDefaultCapabilitySchema(type);
+    if (!capabilities || typeof capabilities !== 'object' || Array.isArray(capabilities)) {
+        return defaults;
+    }
+    return {
+        supportsMultipart: capabilities.supportsMultipart === true,
+        supportsRequestChain: capabilities.supportsRequestChain === true,
+        supportsSSE: capabilities.supportsSSE === true,
+        supportsWS: capabilities.supportsWS === true,
+        supportsTools: capabilities.supportsTools === true
+    };
+};
+const validateModelLibraryContract = (entry) => {
+    const issues = [];
+    if (!entry || typeof entry !== 'object') return issues;
+    const capabilities = normalizeCapabilitySchema(entry.capabilities, entry.type);
+    const requestTemplate = normalizeRequestTemplate(entry.requestTemplate || getDefaultRequestTemplateForEntry(entry));
+    const requestChain = normalizeRequestChain(entry.requestChain);
+    const transportMode = normalizeTransportMode(entry.transport);
+
+    const bodyType = String(requestTemplate?.bodyType || '').toLowerCase();
+    if (bodyType === 'multipart' && !capabilities.supportsMultipart) {
+        issues.push({ level: 'error', code: 'cap_multipart', message: '模板使用 multipart，但 capabilities.supportsMultipart=false' });
+    }
+    if (requestChain?.enabled) {
+        if (!capabilities.supportsRequestChain) {
+            issues.push({ level: 'error', code: 'cap_chain', message: 'requestChain 已启用，但 capabilities.supportsRequestChain=false' });
+        }
+        if (!Array.isArray(requestChain.steps) || requestChain.steps.length === 0) {
+            issues.push({ level: 'error', code: 'chain_empty', message: 'requestChain 已启用，但 steps 为空' });
+        }
+    }
+    if (transportMode === TRANSPORT_HTTP_SSE && !capabilities.supportsSSE) {
+        issues.push({ level: 'error', code: 'cap_sse', message: 'transport=http-sse，但 capabilities.supportsSSE=false' });
+    }
+    if (transportMode === TRANSPORT_WS_STREAM && !capabilities.supportsWS) {
+        issues.push({ level: 'error', code: 'cap_ws', message: 'transport=ws-stream，但 capabilities.supportsWS=false' });
+    }
+    const streamValue = getValueByPathLoose(requestTemplate?.body || {}, 'stream');
+    if (transportMode === TRANSPORT_HTTP_SSE && streamValue !== true) {
+        issues.push({ level: 'warning', code: 'sse_stream_flag', message: 'transport=http-sse 建议 body.stream=true' });
+    }
+    if (transportMode === TRANSPORT_WS_STREAM && requestTemplate?.endpoint && !/^wss?:\/\//i.test(String(requestTemplate.endpoint))) {
+        issues.push({ level: 'warning', code: 'ws_endpoint', message: 'ws-stream 建议 endpoint 使用 ws:// 或 wss://' });
+    }
+    let bodyText = '';
+    try {
+        bodyText = JSON.stringify(requestTemplate?.body || {});
+    } catch {
+        bodyText = '';
+    }
+    if (/"tools"\s*:|"tool_choice"\s*:|"search"\s*:/i.test(bodyText) && !capabilities.supportsTools) {
+        issues.push({ level: 'error', code: 'cap_tools', message: '模板包含 tools/tool_choice/search 字段，但 capabilities.supportsTools=false' });
+    }
+
+    return issues;
+};
 const normalizeStringArray = (value) => {
     if (Array.isArray(value)) {
         return value.map(item => String(item || '').trim()).filter(Boolean);
@@ -3148,6 +3277,79 @@ const normalizeAsyncConfig = (config) => {
         ? normalized.failureValues.map(v => v.toUpperCase())
         : ['FAILED', 'ERROR', 'CANCELLED', 'CANCELED', 'FAILURE'];
     return normalized;
+};
+const normalizeRequestChainExtract = (extract) => {
+    if (!extract) return {};
+    if (Array.isArray(extract)) {
+        const mapped = {};
+        extract.forEach((item) => {
+            if (!item || typeof item !== 'object') return;
+            const targetKey = String(item.to || item.key || item.var || item.name || '').trim();
+            const sourcePath = String(item.path || item.from || item.value || '').trim();
+            if (!targetKey || !sourcePath) return;
+            mapped[targetKey] = sourcePath;
+        });
+        return mapped;
+    }
+    if (typeof extract === 'object') {
+        const mapped = {};
+        Object.entries(extract).forEach(([targetKey, sourcePath]) => {
+            const key = String(targetKey || '').trim();
+            const path = String(sourcePath || '').trim();
+            if (!key || !path) return;
+            mapped[key] = path;
+        });
+        return mapped;
+    }
+    return {};
+};
+const normalizeRequestChainStep = (step, index = 0) => {
+    if (!step || typeof step !== 'object') return null;
+    const typeRaw = String(step.type || 'http').trim().toLowerCase();
+    const type = typeRaw === 'transform' ? 'transform' : 'http';
+    const id = String(step.id || step.name || `step-${index + 1}`).trim() || `step-${index + 1}`;
+    const onErrorRaw = String(step.onError || step.errorStrategy || 'stop').trim().toLowerCase();
+    const onError = ['stop', 'continue', 'fallback'].includes(onErrorRaw) ? onErrorRaw : 'stop';
+    const fallbackVars = step.fallbackVars && typeof step.fallbackVars === 'object' && !Array.isArray(step.fallbackVars)
+        ? { ...step.fallbackVars }
+        : {};
+
+    if (type === 'transform') {
+        const assign = step.assign && typeof step.assign === 'object' && !Array.isArray(step.assign)
+            ? step.assign
+            : {};
+        return {
+            id,
+            type,
+            onError,
+            assign,
+            extract: normalizeRequestChainExtract(step.extract),
+            fallbackVars
+        };
+    }
+
+    const requestRaw = step.request || step.template || step.requestTemplate || step.http || step;
+    const request = normalizeRequestTemplate({ ...requestRaw, enabled: true });
+    return {
+        id,
+        type,
+        onError,
+        request,
+        extract: normalizeRequestChainExtract(step.extract),
+        transport: normalizeTransportMode(step.transport),
+        transportOptions: normalizeTransportOptions(step.transportOptions),
+        fallbackVars
+    };
+};
+const normalizeRequestChain = (chain) => {
+    if (!chain || typeof chain !== 'object') return null;
+    const steps = Array.isArray(chain.steps)
+        ? chain.steps.map((step, idx) => normalizeRequestChainStep(step, idx)).filter(Boolean)
+        : [];
+    return {
+        enabled: chain.enabled === true,
+        steps
+    };
 };
 const normalizeModelLibraryEntry = (entry, index = 0) => {
     if (!entry || typeof entry !== 'object') return null;
@@ -3208,6 +3410,10 @@ const normalizeModelLibraryEntry = (entry, index = 0) => {
         ),
         customParams: normalizeCustomParams(entry.customParams),
         asyncConfig: normalizeAsyncConfig(entry.asyncConfig),
+        requestChain: normalizeRequestChain(entry.requestChain),
+        transport: normalizeTransportMode(entry.transport),
+        transportOptions: normalizeTransportOptions(entry.transportOptions),
+        capabilities: normalizeCapabilitySchema(entry.capabilities, entry.type),
         previewOverrideEnabled: !!entry.previewOverrideEnabled,
         previewOverridePatch: normalizePreviewOverridePatch(entry.previewOverridePatch),
         requestTemplate: normalizeRequestTemplate(entry.requestTemplate || getDefaultRequestTemplateForEntry(entry)),
@@ -3252,6 +3458,12 @@ const getValueByPath = (data, path) => {
         current = current[part];
     }
     return current;
+};
+const getValueByPathLoose = (data, path) => {
+    const raw = String(path || '').trim();
+    if (!raw) return undefined;
+    const normalizedPath = raw.replace(/^\$\.?/, '');
+    return getValueByPath(data, normalizedPath);
 };
 const getValueByPathAny = (data, paths) => {
     if (!paths || paths.length === 0) return undefined;
@@ -6201,7 +6413,9 @@ function TapnowApp() {
     const [libraryRequestPreviewEditing, setLibraryRequestPreviewEditing] = useState(() => new Set());
     const [libraryRequestPreviewDrafts, setLibraryRequestPreviewDrafts] = useState(() => ({}));
     const [libraryRequestTemplateDrafts, setLibraryRequestTemplateDrafts] = useState(() => ({}));
+    const [libraryTransportOptionsDrafts, setLibraryTransportOptionsDrafts] = useState(() => ({}));
     const [libraryAsyncConfigDrafts, setLibraryAsyncConfigDrafts] = useState(() => ({}));
+    const [libraryRequestChainDrafts, setLibraryRequestChainDrafts] = useState(() => ({}));
     const [libraryAsyncPreviewModels, setLibraryAsyncPreviewModels] = useState(() => new Set());
     const [libraryNotesCollapsed, setLibraryNotesCollapsed] = useState(() => ({}));
     const [librarySectionCollapsed, setLibrarySectionCollapsed] = useState(() => ({}));
@@ -8752,6 +8966,18 @@ function TapnowApp() {
         });
         return map;
     }, [modelLibrary]);
+    const modelLibraryContractIssuesById = useMemo(() => {
+        const result = {};
+        modelLibrary.forEach((entry, idx) => {
+            const normalized = normalizeModelLibraryEntry(entry, idx);
+            if (!normalized?.id) return;
+            const issues = validateModelLibraryContract(normalized);
+            if (issues.length > 0) {
+                result[normalized.id] = issues;
+            }
+        });
+        return result;
+    }, [modelLibrary]);
 
     const hasExpandedLibraryModels = modelLibrary.some(entry => !collapsedLibraryModels.has(entry.id));
 
@@ -8817,6 +9043,10 @@ function TapnowApp() {
             ),
             customParams: resolvedLibrary ? normalizeCustomParams(resolvedLibrary.customParams) : normalizeCustomParams(config.customParams),
             asyncConfig: normalizeAsyncConfig(resolvedLibrary?.asyncConfig || config.asyncConfig),
+            requestChain: normalizeRequestChain(resolvedLibrary?.requestChain || config.requestChain),
+            transport: normalizeTransportMode(resolvedLibrary?.transport || config.transport),
+            transportOptions: normalizeTransportOptions(resolvedLibrary?.transportOptions || config.transportOptions),
+            capabilities: normalizeCapabilitySchema(resolvedLibrary?.capabilities || config.capabilities, resolvedLibrary?.type || config.type),
             previewOverrideEnabled: resolvedLibrary ? !!resolvedLibrary.previewOverrideEnabled : !!config.previewOverrideEnabled,
             previewOverridePatch: normalizePreviewOverridePatch(resolvedLibrary?.previewOverridePatch || config.previewOverridePatch),
             requestTemplate: normalizeRequestTemplate(resolvedLibrary?.requestTemplate || config.requestTemplate),
@@ -11220,6 +11450,10 @@ function TapnowApp() {
             apiType: 'openai',
             customParams: [],
             asyncConfig: null,
+            requestChain: null,
+            transport: TRANSPORT_HTTP_JSON,
+            transportOptions: { ...DEFAULT_TRANSPORT_OPTIONS },
+            capabilities: buildDefaultCapabilitySchema('Image'),
             previewOverrideEnabled: false,
             previewOverridePatch: null,
             requestOverrideEnabled: false,
@@ -11262,6 +11496,10 @@ function TapnowApp() {
             displayName: `${displayBase}（复制）`,
             modelName: cloned.modelName || cloned.id || newId,
             customParams: normalizeCustomParams(duplicatedParams),
+            requestChain: normalizeRequestChain(cloned.requestChain),
+            transport: normalizeTransportMode(cloned.transport),
+            transportOptions: normalizeTransportOptions(cloned.transportOptions),
+            capabilities: normalizeCapabilitySchema(cloned.capabilities, cloned.type || source.type),
             requestTemplate: normalizeRequestTemplate(cloned.requestTemplate || getDefaultRequestTemplateForEntry(cloned)),
             previewOverridePatch: normalizePreviewOverridePatch(cloned.previewOverridePatch),
             requestOverridePatch: normalizeRequestOverridePatch(cloned.requestOverridePatch)
@@ -11396,6 +11634,16 @@ function TapnowApp() {
             return rest;
         });
         setLibraryRequestTemplateDrafts(prev => {
+            if (!prev[id]) return prev;
+            const { [id]: _removed, ...rest } = prev;
+            return rest;
+        });
+        setLibraryTransportOptionsDrafts(prev => {
+            if (!prev[id]) return prev;
+            const { [id]: _removed, ...rest } = prev;
+            return rest;
+        });
+        setLibraryRequestChainDrafts(prev => {
             if (!prev[id]) return prev;
             const { [id]: _removed, ...rest } = prev;
             return rest;
@@ -11728,6 +11976,447 @@ function TapnowApp() {
         return Array.from(urls);
     };
 
+    const extractTransportTextContent = (payload, preferredPath = '') => {
+        if (preferredPath) {
+            const byPreferredPath = getValueByPathLoose(payload, preferredPath);
+            if (typeof byPreferredPath === 'string') return byPreferredPath;
+            if (Array.isArray(byPreferredPath)) {
+                const joined = byPreferredPath
+                    .map(item => (typeof item === 'string' ? item : ''))
+                    .filter(Boolean)
+                    .join('\n');
+                if (joined) return joined;
+            }
+        }
+        const directCandidates = [
+            payload?.choices?.[0]?.delta?.content,
+            payload?.choices?.[0]?.message?.content,
+            payload?.delta?.content,
+            payload?.message?.content,
+            payload?.text,
+            payload?.content,
+            payload?.output_text,
+            payload?.data?.text,
+            payload?.data?.content
+        ];
+        for (const candidate of directCandidates) {
+            if (typeof candidate === 'string' && candidate.trim()) {
+                return candidate;
+            }
+        }
+        return '';
+    };
+
+    const executeTransportRequest = async ({
+        request,
+        baseUrl,
+        providerKey,
+        transport = TRANSPORT_HTTP_JSON,
+        transportOptions = DEFAULT_TRANSPORT_OPTIONS
+    }) => {
+        if (!request || !request.url) {
+            return { ok: false, status: 0, data: null, text: '', aggregateText: '', events: [], errorMessage: 'request.url 为空' };
+        }
+
+        const mode = normalizeTransportMode(transport);
+        const options = normalizeTransportOptions(transportOptions);
+        const requestMethod = (request?.method || 'POST').toString().toUpperCase();
+        let requestBodyType = (request?.bodyType || 'json').toString().toLowerCase();
+        const requestHeaders = request?.headers && typeof request.headers === 'object'
+            ? { ...request.headers }
+            : {};
+        let requestBody = request?.body;
+        if (requestBody instanceof FormData) {
+            requestBodyType = 'multipart';
+        }
+        if (requestBodyType === 'json' && !requestHeaders['Content-Type'] && !requestHeaders['content-type']) {
+            requestHeaders['Content-Type'] = 'application/json';
+        }
+        if (mode === TRANSPORT_HTTP_SSE && !requestHeaders.Accept && !requestHeaders.accept) {
+            requestHeaders.Accept = 'text/event-stream';
+        }
+        if (requestBodyType === 'multipart') {
+            requestBody = coerceFormDataFromObject(requestBody);
+            delete requestHeaders['Content-Type'];
+            delete requestHeaders['content-type'];
+        } else if (requestBodyType === 'raw') {
+            if (typeof requestBody !== 'string') {
+                requestBody = JSON.stringify(requestBody ?? {});
+            }
+        } else if (requestBodyType === 'json') {
+            if (!(requestBody instanceof FormData) && typeof requestBody !== 'string') {
+                requestBody = JSON.stringify(requestBody ?? {});
+            }
+        }
+
+        const requestUrl = String(request.url || '').trim();
+        const cleanBaseUrl = String(baseUrl || '').trim().replace(/\/+$/, '');
+        const absoluteUrl = requestUrl.startsWith('http')
+            ? requestUrl
+            : `${cleanBaseUrl}${requestUrl.startsWith('/') ? requestUrl : `/${requestUrl}`}`;
+        const timeoutMs = Number.isFinite(request?.timeoutMs) && request.timeoutMs > 0
+            ? Number(request.timeoutMs)
+            : null;
+
+        if (mode === TRANSPORT_WS_STREAM) {
+            if (typeof WebSocket === 'undefined') {
+                return { ok: false, status: 0, data: null, text: '', aggregateText: '', events: [], errorMessage: '当前环境不支持 WebSocket' };
+            }
+            let wsUrl = absoluteUrl;
+            if (wsUrl.startsWith('http://')) wsUrl = `ws://${wsUrl.slice('http://'.length)}`;
+            if (wsUrl.startsWith('https://')) wsUrl = `wss://${wsUrl.slice('https://'.length)}`;
+            if (!/^wss?:\/\//i.test(wsUrl)) {
+                return { ok: false, status: 0, data: null, text: '', aggregateText: '', events: [], errorMessage: 'ws-stream 需要 ws:// 或 wss:// endpoint' };
+            }
+
+            return await new Promise((resolve) => {
+                let socketClosed = false;
+                let timer = null;
+                let rawText = '';
+                let aggregateText = '';
+                let lastPayload = null;
+                const events = [];
+
+                const finalize = (result) => {
+                    if (socketClosed) return;
+                    socketClosed = true;
+                    if (timer) clearTimeout(timer);
+                    try { ws.close(); } catch { }
+                    resolve(result);
+                };
+
+                const ws = new WebSocket(wsUrl);
+                if (timeoutMs) {
+                    timer = setTimeout(() => {
+                        finalize({
+                            ok: false,
+                            status: 0,
+                            data: lastPayload,
+                            text: rawText,
+                            aggregateText,
+                            events,
+                            errorMessage: `ws-stream timeout(${timeoutMs}ms)`
+                        });
+                    }, timeoutMs);
+                }
+
+                ws.onopen = () => {
+                    if (requestMethod !== 'GET' && requestBody !== undefined && requestBody !== null) {
+                        if (requestBody instanceof FormData) {
+                            finalize({
+                                ok: false,
+                                status: 0,
+                                data: null,
+                                text: '',
+                                aggregateText: '',
+                                events,
+                                errorMessage: 'ws-stream 暂不支持 multipart 请求体'
+                            });
+                            return;
+                        }
+                        const payloadToSend = typeof requestBody === 'string'
+                            ? requestBody
+                            : JSON.stringify(requestBody);
+                        ws.send(payloadToSend);
+                    }
+                };
+
+                ws.onerror = () => {
+                    finalize({
+                        ok: false,
+                        status: 0,
+                        data: lastPayload,
+                        text: rawText,
+                        aggregateText,
+                        events,
+                        errorMessage: 'ws-stream 连接失败'
+                    });
+                };
+
+                ws.onmessage = (event) => {
+                    const messageText = typeof event.data === 'string' ? event.data : '';
+                    rawText += messageText;
+                    let payload = null;
+                    if (messageText) {
+                        try {
+                            payload = JSON.parse(messageText);
+                            lastPayload = payload;
+                        } catch {
+                            payload = messageText;
+                        }
+                    }
+                    events.push(payload);
+                    const doneToken = options.wsDoneToken || '[DONE]';
+                    if (typeof payload === 'string' && payload.trim() === doneToken) {
+                        finalize({
+                            ok: true,
+                            status: 200,
+                            data: lastPayload,
+                            text: rawText,
+                            aggregateText,
+                            events
+                        });
+                        return;
+                    }
+                    const delta = typeof payload === 'object'
+                        ? extractTransportTextContent(payload, options.wsMessagePath)
+                        : (typeof payload === 'string' ? payload : '');
+                    if (delta) aggregateText += delta;
+                };
+
+                ws.onclose = () => {
+                    finalize({
+                        ok: true,
+                        status: 200,
+                        data: lastPayload,
+                        text: rawText,
+                        aggregateText,
+                        events
+                    });
+                };
+            });
+        }
+
+        const finalUrl = buildProxyUrl(absoluteUrl, providerKey);
+        const controller = timeoutMs && typeof AbortController !== 'undefined'
+            ? new AbortController()
+            : null;
+        let timeoutHandle = null;
+        if (controller && timeoutMs) {
+            timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+        }
+
+        let response;
+        try {
+            response = await fetch(finalUrl, {
+                method: requestMethod,
+                headers: requestHeaders,
+                body: requestBody,
+                signal: controller?.signal
+            });
+        } catch (error) {
+            if (timeoutHandle) clearTimeout(timeoutHandle);
+            return {
+                ok: false,
+                status: 0,
+                data: null,
+                text: '',
+                aggregateText: '',
+                events: [],
+                errorMessage: error?.message || String(error)
+            };
+        } finally {
+            if (timeoutHandle) clearTimeout(timeoutHandle);
+        }
+
+        if (mode !== TRANSPORT_HTTP_SSE || !response.body) {
+            const text = await response.text();
+            let data = null;
+            if (text) {
+                try {
+                    data = JSON.parse(text);
+                } catch {
+                    data = null;
+                }
+            }
+            return {
+                ok: response.ok,
+                status: response.status,
+                data,
+                text,
+                aggregateText: data ? extractTransportTextContent(data, options.sseDeltaPath) : '',
+                events: []
+            };
+        }
+
+        const decoder = new TextDecoder('utf-8');
+        const reader = response.body.getReader();
+        const delimiter = options.sseDelimiter || '\n\n';
+        const dataPrefix = options.sseDataPrefix || 'data:';
+        const doneToken = options.sseDoneToken || '[DONE]';
+        const events = [];
+        let aggregateText = '';
+        let rawText = '';
+        let buffer = '';
+        let lastPayload = null;
+        let done = false;
+
+        const consumeSseBlock = (block) => {
+            if (!block) return;
+            const lines = block.split(/\r?\n/);
+            const payloadLines = [];
+            lines.forEach((line) => {
+                const trimmed = line.trim();
+                if (!trimmed) return;
+                if (dataPrefix) {
+                    if (trimmed.startsWith(dataPrefix)) {
+                        payloadLines.push(trimmed.slice(dataPrefix.length).trim());
+                    }
+                    return;
+                }
+                payloadLines.push(trimmed);
+            });
+            if (payloadLines.length === 0) return;
+            const payloadText = payloadLines.join('\n').trim();
+            if (!payloadText) return;
+            if (payloadText === doneToken) {
+                done = true;
+                return;
+            }
+            let payload = null;
+            try {
+                payload = JSON.parse(payloadText);
+                lastPayload = payload;
+            } catch {
+                payload = payloadText;
+            }
+            events.push(payload);
+            const delta = typeof payload === 'object'
+                ? extractTransportTextContent(payload, options.sseDeltaPath)
+                : (typeof payload === 'string' ? payload : '');
+            if (delta) aggregateText += delta;
+        };
+
+        while (true) {
+            const { done: streamDone, value } = await reader.read();
+            if (streamDone) break;
+            const chunk = decoder.decode(value, { stream: true });
+            rawText += chunk;
+            buffer += chunk;
+            let index = buffer.indexOf(delimiter);
+            while (index >= 0) {
+                const block = buffer.slice(0, index);
+                buffer = buffer.slice(index + delimiter.length);
+                consumeSseBlock(block);
+                index = buffer.indexOf(delimiter);
+            }
+            if (done) break;
+        }
+
+        if (!done && buffer.trim()) {
+            consumeSseBlock(buffer);
+        }
+
+        return {
+            ok: response.ok,
+            status: response.status,
+            data: lastPayload || null,
+            text: rawText,
+            aggregateText,
+            events
+        };
+    };
+
+    const runRequestChain = async (
+        requestChain,
+        baseVars,
+        providerKey,
+        defaultTransport = TRANSPORT_HTTP_JSON,
+        defaultTransportOptions = DEFAULT_TRANSPORT_OPTIONS
+    ) => {
+        if (!requestChain?.enabled || !Array.isArray(requestChain.steps) || requestChain.steps.length === 0) {
+            return baseVars;
+        }
+        const vars = {
+            ...(baseVars || {}),
+            chain: (baseVars && typeof baseVars.chain === 'object' && !Array.isArray(baseVars.chain))
+                ? { ...baseVars.chain }
+                : {}
+        };
+
+        for (const rawStep of requestChain.steps) {
+            const step = normalizeRequestChainStep(rawStep);
+            if (!step) continue;
+            const stepId = step.id || `step-${Date.now()}`;
+            try {
+                if (step.type === 'transform') {
+                    const assignResult = resolveTemplateValue(step.assign || {}, vars, { bodyType: 'json' });
+                    if (assignResult && typeof assignResult === 'object' && !Array.isArray(assignResult)) {
+                        Object.assign(vars, assignResult);
+                    }
+                    const extractSource = assignResult && typeof assignResult === 'object'
+                        ? assignResult
+                        : vars;
+                    Object.entries(step.extract || {}).forEach(([targetKey, sourcePath]) => {
+                        const value = getValueByPathLoose(extractSource, sourcePath);
+                        if (value !== undefined) vars[targetKey] = value;
+                    });
+                    vars.chain[stepId] = {
+                        type: 'transform',
+                        status: 'ok'
+                    };
+                    continue;
+                }
+
+                const stepTemplate = normalizeRequestTemplate(step.request || {});
+                if (!stepTemplate?.endpoint) {
+                    throw new Error('request.endpoint 为空');
+                }
+                let request = buildRequestFromTemplate(stepTemplate, vars, { bodyType: stepTemplate.bodyType });
+                if (!request || !request.url) {
+                    throw new Error('请求模板构建失败');
+                }
+                const providerKeyValue = vars?.provider?.key || baseVars?.provider?.key;
+                if (providerKeyValue) {
+                    const requestHeaders = request?.headers && typeof request.headers === 'object'
+                        ? { ...request.headers }
+                        : {};
+                    if (!requestHeaders.Authorization && !requestHeaders.authorization) {
+                        requestHeaders.Authorization = `Bearer ${providerKeyValue}`;
+                        request = { ...request, headers: requestHeaders };
+                    }
+                }
+                const baseUrl = String(vars?.provider?.baseUrl || baseVars?.provider?.baseUrl || '').trim().replace(/\/+$/, '');
+                const stepTransportMode = normalizeTransportMode(step.transport || defaultTransport);
+                const stepTransportOptions = normalizeTransportOptions(step.transportOptions || defaultTransportOptions);
+                const response = await executeTransportRequest({
+                    request,
+                    baseUrl,
+                    providerKey,
+                    transport: stepTransportMode,
+                    transportOptions: stepTransportOptions
+                });
+                if (!response.ok) {
+                    const errorText = response?.data?.message || response?.data?.error?.message || response?.errorMessage || response?.text;
+                    throw new Error(errorText || `HTTP ${response.status || 0}`);
+                }
+                const extractSource = response.data ?? { text: response.text || '' };
+                Object.entries(step.extract || {}).forEach(([targetKey, sourcePath]) => {
+                    const value = getValueByPathLoose(extractSource, sourcePath);
+                    if (value !== undefined) vars[targetKey] = value;
+                });
+                vars.chain[stepId] = {
+                    type: 'http',
+                    status: response.status || 200,
+                    data: extractSource
+                };
+            } catch (error) {
+                const strategy = step.onError || 'stop';
+                const fallbackVars = resolveTemplateValue(step.fallbackVars || {}, vars, { bodyType: 'json' });
+                if (strategy === 'fallback') {
+                    if (fallbackVars && typeof fallbackVars === 'object' && !Array.isArray(fallbackVars)) {
+                        Object.assign(vars, fallbackVars);
+                    }
+                    vars.chain[stepId] = {
+                        status: 'fallback',
+                        error: error?.message || String(error)
+                    };
+                    continue;
+                }
+                if (strategy === 'continue') {
+                    vars.chain[stepId] = {
+                        status: 'continue',
+                        error: error?.message || String(error)
+                    };
+                    continue;
+                }
+                throw new Error(`[RequestChain:${stepId}] ${error?.message || String(error)}`);
+            }
+        }
+
+        return vars;
+    };
+
     const sendChatMessage = async () => {
         if ((!chatInput.trim() && chatFiles.length === 0) || isChatSending) return;
 
@@ -11839,61 +12528,288 @@ function TapnowApp() {
         apiMessages.push({ role: 'user', content: currentContent });
 
         try {
-            const response = await fetch(`${baseUrl}/v1/chat/completions`, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    model: modelName || chatModel, // V3.7.23: 使用 getApiCredentials 返回的 modelName
-                    messages: apiMessages,
-                    stream: false
-                })
+            const contractIssues = validateModelLibraryContract(config || {});
+            const blockingIssue = contractIssues.find((issue) => issue.level === 'error');
+            if (blockingIssue) {
+                throw new Error(`[配置校验阻断] ${blockingIssue.message}`);
+            }
+            const parseChatContent = (payload) => {
+                if (!payload || typeof payload !== 'object') return null;
+                const primaryMessage = payload?.choices?.[0]?.message || payload?.data?.choices?.[0]?.message;
+                if (primaryMessage?.content !== undefined) {
+                    if (Array.isArray(primaryMessage.content)) {
+                        return primaryMessage.content
+                            .map(part => (typeof part?.text === 'string' ? part.text : ''))
+                            .filter(Boolean)
+                            .join('\n');
+                    }
+                    return primaryMessage.content;
+                }
+                if (payload.content !== undefined) return payload.content;
+                if (payload.text !== undefined) return payload.text;
+                if (payload.message !== undefined) {
+                    return typeof payload.message === 'string' ? payload.message : payload.message?.content;
+                }
+                if (payload.result !== undefined) {
+                    return typeof payload.result === 'string' ? payload.result : payload.result?.content;
+                }
+                if (payload.data?.content !== undefined) return payload.data.content;
+                if (payload.data?.text !== undefined) return payload.data.text;
+                if (payload.data?.message !== undefined) {
+                    return typeof payload.data.message === 'string' ? payload.data.message : payload.data.message?.content;
+                }
+                if (payload.data?.result !== undefined) {
+                    return typeof payload.data.result === 'string' ? payload.data.result : payload.data.result?.content;
+                }
+                return null;
+            };
+
+            const fallbackTemplate = getDefaultRequestTemplateForType(config?.type || 'Chat');
+            const requestTemplate = normalizeRequestTemplate(config?.requestTemplate || fallbackTemplate)
+                || normalizeRequestTemplate(fallbackTemplate);
+            if (!requestTemplate?.endpoint) {
+                throw new Error('聊天请求模板未配置 endpoint');
+            }
+            const requestChain = normalizeRequestChain(config?.requestChain);
+            const transportMode = normalizeTransportMode(config?.transport);
+            const transportOptions = normalizeTransportOptions(config?.transportOptions);
+            const requestOverrideEnabled = !!config?.requestOverrideEnabled;
+            const requestOverridePatch = normalizeRequestOverridePatch(config?.requestOverridePatch);
+
+            const templateText = JSON.stringify(requestTemplate || {});
+            const needsBlob = (requestTemplate?.bodyType || '').toLowerCase() === 'multipart'
+                || /:blob\s*}}/.test(templateText);
+            const needsDataUrl = /:blob\s*}}/.test(templateText);
+
+            const attachmentMetas = (newUserMsg.files || []).map((file, idx) => {
+                const rawContent = typeof file?.content === 'string' ? file.content : '';
+                const isDataUrl = rawContent.startsWith('data:');
+                const isHttpUrl = rawContent.startsWith('http://') || rawContent.startsWith('https://');
+                return {
+                    index: idx + 1,
+                    name: file?.name || `file-${idx + 1}`,
+                    type: file?.type || 'application/octet-stream',
+                    fileExt: file?.fileExt || '',
+                    isImage: !!file?.isImage,
+                    isVideo: !!file?.isVideo,
+                    isAudio: !!file?.isAudio,
+                    isPDF: !!file?.isPDF,
+                    isDoc: !!file?.isDoc,
+                    isExcel: !!file?.isExcel,
+                    isCode: !!file?.isCode,
+                    rawContent,
+                    url: isDataUrl || isHttpUrl ? rawContent : '',
+                    dataUrl: isDataUrl ? rawContent : ''
+                };
             });
 
-            if (!response.ok) {
-                const errText = await response.text();
-                throw new Error(errText || `API Error: ${response.status}`);
+            const buildAttachmentBlob = async (attachment) => {
+                if (!attachment) return null;
+                if (attachment.dataUrl) {
+                    try {
+                        return dataUrlToBlob(attachment.dataUrl);
+                    } catch {
+                        return null;
+                    }
+                }
+                if (attachment.url) {
+                    try {
+                        const useProxy = getProxyPreferenceForUrl(attachment.url, false);
+                        return await getBlobFromUrl(attachment.url, { useProxy });
+                    } catch {
+                        return null;
+                    }
+                }
+                if (attachment.rawContent) {
+                    return new Blob([attachment.rawContent], { type: attachment.type || 'text/plain' });
+                }
+                return null;
+            };
+
+            const templateVars = {
+                modelName: modelName || chatModel,
+                prompt: newUserMsg.content || '',
+                input: newUserMsg.content || '',
+                stream: false,
+                messages: apiMessages,
+                chatMessages: apiMessages,
+                provider: {
+                    key: apiKey,
+                    baseUrl,
+                    id: config?.provider,
+                    useProxy: !!(config?.provider && providers?.[config.provider]?.useProxy)
+                },
+                files: attachmentMetas,
+                attachments: attachmentMetas,
+                fileCount: attachmentMetas.length
+            };
+
+            if (attachmentMetas.length > 0) {
+                const firstAttachment = attachmentMetas[0];
+                templateVars.fileName = firstAttachment.name;
+                templateVars.fileUrl = firstAttachment.url;
+                templateVars.fileDataUrl = firstAttachment.dataUrl;
+                templateVars.fileDataURL = firstAttachment.dataUrl;
+                templateVars.fileUrls = attachmentMetas.map(item => item.url).filter(Boolean);
+                templateVars.fileNames = attachmentMetas.map(item => item.name);
+
+                attachmentMetas.forEach((attachment) => {
+                    const index = attachment.index;
+                    templateVars[`fileName${index}`] = attachment.name;
+                    templateVars[`file${index}Name`] = attachment.name;
+                    templateVars[`fileUrl${index}`] = attachment.url;
+                    templateVars[`file${index}Url`] = attachment.url;
+                    templateVars[`fileDataUrl${index}`] = attachment.dataUrl;
+                    templateVars[`fileDataURL${index}`] = attachment.dataUrl;
+                    templateVars[`file${index}DataUrl`] = attachment.dataUrl;
+                    templateVars[`file${index}DataURL`] = attachment.dataUrl;
+                });
             }
 
-            const data = await response.json();
-            // 支持多种响应格式
-            let aiContent = null;
-            const primaryMessage = data?.choices?.[0]?.message || data?.data?.choices?.[0]?.message;
-            if (primaryMessage?.content !== undefined) {
-                if (Array.isArray(primaryMessage.content)) {
-                    aiContent = primaryMessage.content
-                        .map(part => (typeof part?.text === 'string' ? part.text : ''))
-                        .filter(Boolean)
-                        .join('\n');
-                } else {
-                    aiContent = primaryMessage.content;
+            const imageAttachments = attachmentMetas.filter((attachment) => attachment.isImage || attachment.isVideo);
+            const imageSources = imageAttachments
+                .map((attachment) => attachment.url || attachment.dataUrl)
+                .filter(Boolean);
+            if (imageSources.length > 0) {
+                templateVars.imageUrl = imageSources[0];
+                templateVars.imageUrls = imageSources;
+                templateVars.imagesUrl = imageSources;
+                templateVars.imagesUrls = imageSources;
+                imageSources.forEach((url, idx) => {
+                    const index = idx + 1;
+                    templateVars[`imageUrl${index}`] = url;
+                    templateVars[`image${index}Url`] = url;
+                });
+            }
+
+            if (needsDataUrl && attachmentMetas.length > 0) {
+                const dataUrls = await Promise.all(attachmentMetas.map(async (attachment) => {
+                    if (attachment.dataUrl) return attachment.dataUrl;
+                    if (attachment.url) {
+                        try {
+                            const useProxy = getProxyPreferenceForUrl(attachment.url, false);
+                            const base64 = await getBase64FromUrl(attachment.url, { useProxy });
+                            const mimeType = attachment.type || 'application/octet-stream';
+                            return `data:${mimeType};base64,${base64}`;
+                        } catch {
+                            return '';
+                        }
+                    }
+                    if (attachment.rawContent) {
+                        const blob = new Blob([attachment.rawContent], { type: attachment.type || 'text/plain' });
+                        try {
+                            return await blobToDataURL(blob);
+                        } catch {
+                            return '';
+                        }
+                    }
+                    return '';
+                }));
+                if (dataUrls.length > 0) {
+                    templateVars.fileDataUrls = dataUrls.filter(Boolean);
+                    dataUrls.forEach((dataUrl, idx) => {
+                        const index = idx + 1;
+                        templateVars[`fileDataUrl${index}`] = dataUrl;
+                        templateVars[`fileDataURL${index}`] = dataUrl;
+                        templateVars[`file${index}DataUrl`] = dataUrl;
+                        templateVars[`file${index}DataURL`] = dataUrl;
+                    });
+                    if (dataUrls[0]) {
+                        templateVars.fileDataUrl = dataUrls[0];
+                        templateVars.fileDataURL = dataUrls[0];
+                    }
+                    const imageDataUrls = dataUrls.filter(Boolean);
+                    if (imageDataUrls.length > 0) {
+                        templateVars.imageDataUrl = imageDataUrls[0];
+                        templateVars.imageDataURL = imageDataUrls[0];
+                        templateVars.imageDataUrls = imageDataUrls;
+                        templateVars.imagesDataUrl = imageDataUrls;
+                        templateVars.imagesDataURL = imageDataUrls;
+                        imageDataUrls.forEach((dataUrl, idx) => {
+                            const index = idx + 1;
+                            templateVars[`imageDataUrl${index}`] = dataUrl;
+                            templateVars[`imageDataURL${index}`] = dataUrl;
+                            templateVars[`image${index}DataUrl`] = dataUrl;
+                            templateVars[`image${index}DataURL`] = dataUrl;
+                        });
+                    }
                 }
-            } else if (data.content) {
-                // 直接 content 字段
-                aiContent = data.content;
-            } else if (data.text) {
-                // text 字段
-                aiContent = data.text;
-            } else if (data.message) {
-                // message 字段
-                aiContent = typeof data.message === 'string' ? data.message : data.message.content;
-            } else if (data.result) {
-                // result 字段
-                aiContent = typeof data.result === 'string' ? data.result : data.result.content;
-            } else if (data.data?.content) {
-                // 嵌套 data.content 格式
-                aiContent = data.data.content;
-            } else if (data.data?.text) {
-                // 嵌套 data.text 格式
-                aiContent = data.data.text;
-            } else if (data.data?.message) {
-                // 嵌套 data.message 格式
-                aiContent = typeof data.data.message === 'string' ? data.data.message : data.data.message.content;
-            } else if (data.data?.result) {
-                // 嵌套 data.result 格式
-                aiContent = typeof data.data.result === 'string' ? data.data.result : data.data.result.content;
+            }
+
+            if (needsBlob && attachmentMetas.length > 0) {
+                const attachmentBlobs = await Promise.all(attachmentMetas.map((attachment) => buildAttachmentBlob(attachment)));
+                templateVars.fileBlob = attachmentBlobs[0] || null;
+                templateVars.fileBlobs = attachmentBlobs.filter(Boolean);
+                attachmentBlobs.forEach((blob, idx) => {
+                    const index = idx + 1;
+                    templateVars[`fileBlob${index}`] = blob;
+                    templateVars[`file${index}Blob`] = blob;
+                });
+
+                const imageBlobs = [];
+                for (const attachment of imageAttachments) {
+                    const blob = await buildAttachmentBlob(attachment);
+                    if (blob) imageBlobs.push(blob);
+                }
+                if (imageBlobs.length > 0) {
+                    templateVars.imageBlob = imageBlobs[0];
+                    templateVars.imageBlobs = imageBlobs;
+                    templateVars.imagesBlob = imageBlobs;
+                    imageBlobs.forEach((blob, idx) => {
+                        const index = idx + 1;
+                        templateVars[`imageBlob${index}`] = blob;
+                        templateVars[`image${index}Blob`] = blob;
+                    });
+                }
+            }
+
+            const requestVars = await runRequestChain(
+                requestChain,
+                templateVars,
+                config?.provider,
+                transportMode,
+                transportOptions
+            );
+            let request = buildRequestFromTemplate(requestTemplate, requestVars, { bodyType: requestTemplate.bodyType });
+            if (!request || !request.url) {
+                throw new Error('聊天请求模板构建失败');
+            }
+            request = requestOverrideEnabled && requestOverridePatch
+                ? applyRequestOverridePatch({ ...request }, requestOverridePatch)
+                : request;
+
+            const requestHeaders = request?.headers && typeof request.headers === 'object'
+                ? { ...request.headers }
+                : {};
+            if (apiKey && !requestHeaders.Authorization && !requestHeaders.authorization) {
+                requestHeaders.Authorization = `Bearer ${apiKey}`;
+                request = { ...request, headers: requestHeaders };
+            }
+
+            const transportResult = await executeTransportRequest({
+                request,
+                baseUrl,
+                providerKey: config?.provider,
+                transport: transportMode,
+                transportOptions
+            });
+
+            if (!transportResult.ok) {
+                const errorText = transportResult?.data?.message
+                    || transportResult?.data?.error?.message
+                    || transportResult?.errorMessage
+                    || transportResult?.text;
+                throw new Error(errorText || `API Error: ${transportResult.status || 0}`);
+            }
+
+            const data = transportResult.data;
+
+            let aiContent = parseChatContent(data);
+            if ((!aiContent || String(aiContent).trim() === '') && transportResult.aggregateText) {
+                aiContent = transportResult.aggregateText;
+            }
+            if ((!aiContent || String(aiContent).trim() === '') && data === null && transportResult.text) {
+                aiContent = transportResult.text;
             }
 
             if (aiContent && typeof aiContent !== 'string') {
@@ -11913,13 +12829,13 @@ function TapnowApp() {
             };
 
             setChatSessions(prev => prev.map(s => {
-                if (s.id === currentChatId) {
+                if (s.id === chatIdToUse) {
                     return { ...s, messages: [...s.messages, newAssistantMsg] };
                 }
                 return s;
             }));
 
-            const chatImageUrls = extractChatImageUrls(data, aiContent);
+            const chatImageUrls = extractChatImageUrls(data || {}, aiContent);
             if (chatImageUrls.length > 0) {
                 const now = Date.now();
                 const primaryUrl = chatImageUrls[0];
@@ -11958,7 +12874,7 @@ function TapnowApp() {
             };
 
             setChatSessions(prev => prev.map(s => {
-                if (s.id === currentChatId) {
+                if (s.id === chatIdToUse) {
                     return { ...s, messages: [...s.messages, errorMsg] };
                 }
                 return s;
@@ -15238,6 +16154,11 @@ function TapnowApp() {
         const modelId = options.model || node?.settings?.model || (type === 'image' ? 'nano-banana' : 'sora-2');
         const customParamSelections = options.customParams || node?.settings?.customParams || null;
         const resolvedConfig = getApiConfigByKey(modelId);
+        const generationContractIssues = validateModelLibraryContract(resolvedConfig || {});
+        const generationBlockingIssue = generationContractIssues.find((issue) => issue.level === 'error');
+        if (generationBlockingIssue) {
+            throw new Error(`[配置校验阻断] ${generationBlockingIssue.message}`);
+        }
         const resolvedCustomParams = Array.isArray(resolvedConfig?.customParams) ? resolvedConfig.customParams : [];
         const fallbackImageConcurrency = options.imageConcurrency
             || options.concurrentImages
@@ -19387,6 +20308,8 @@ function TapnowApp() {
             let objectBuffer = '';
             let braceCount = 0;
             let inObject = false;
+            let inString = false;
+            let escapeNext = false;
             let bytesRead = 0;
             const totalBytes = file.size;
 
@@ -19470,6 +20393,8 @@ function TapnowApp() {
                             currentSection = null;
                             objectBuffer = '';
                             inObject = false;
+                            inString = false;
+                            escapeNext = false;
                             continue;
                         }
 
@@ -19491,12 +20416,30 @@ function TapnowApp() {
                         // 对象累积
                         if (currentSection) {
                             for (let char of line) {
+                                if (inString) {
+                                    if (escapeNext) {
+                                        escapeNext = false;
+                                        continue;
+                                    }
+                                    if (char === '\\') {
+                                        escapeNext = true;
+                                        continue;
+                                    }
+                                    if (char === '"') {
+                                        inString = false;
+                                    }
+                                    continue;
+                                }
+                                if (char === '"') {
+                                    inString = true;
+                                    continue;
+                                }
                                 if (char === '{') { braceCount++; inObject = true; }
-                                if (char === '}') { braceCount--; }
+                                if (char === '}') { braceCount = Math.max(0, braceCount - 1); }
                             }
                             objectBuffer += line + '\n';
 
-                            if (inObject && braceCount === 0) {
+                            if (inObject && braceCount === 0 && !inString) {
                                 let jsonStr = objectBuffer.trim();
                                 if (jsonStr.endsWith(',')) jsonStr = jsonStr.slice(0, -1);
 
@@ -19529,6 +20472,8 @@ function TapnowApp() {
                                 }
                                 objectBuffer = '';
                                 inObject = false;
+                                inString = false;
+                                escapeNext = false;
                             }
                         }
                     }
@@ -24414,6 +25359,107 @@ ${inputText.substring(0, 15000)} ... (截断)
         setHistorySendMenuOpen(false);
     };
 
+    const resolvePrimarySelectedNodeId = () => {
+        if (selectedNodeIdRef.current) return selectedNodeIdRef.current;
+        if (selectedNodeIdsRef.current && selectedNodeIdsRef.current.size > 0) {
+            return [...selectedNodeIdsRef.current][0];
+        }
+        return null;
+    };
+
+    const applyHistoryPromptToNode = (targetNodeId, promptText) => {
+        if (!targetNodeId || !promptText) return { applied: false };
+        const targetNode = nodesMap.get(targetNodeId);
+        if (!targetNode) return { applied: false };
+
+        const normalizedPrompt = String(promptText || '').trim();
+        if (!normalizedPrompt) return { applied: false };
+        const settings = targetNode.settings || {};
+
+        if (targetNode.type === 'storyboard-node') {
+            updateNodeSettings(targetNode.id, { scriptText: normalizedPrompt, scriptExpanded: true });
+            return { applied: true, target: 'script' };
+        }
+        if (targetNode.type === 'gen-video' || targetNode.type === 'generate-character-video' || targetNode.type === 'generate-scene-video') {
+            updateNodeSettings(targetNode.id, { videoPrompt: normalizedPrompt });
+            return { applied: true, target: 'node' };
+        }
+        if (targetNode.type === 'text-node') {
+            updateNodeSettings(targetNode.id, { text: normalizedPrompt });
+            return { applied: true, target: 'node' };
+        }
+        if (targetNode.type === 'novel-input') {
+            updateNodeSettings(targetNode.id, { content: normalizedPrompt });
+            return { applied: true, target: 'node' };
+        }
+        if (Object.prototype.hasOwnProperty.call(settings, 'prompt')) {
+            updateNodeSettings(targetNode.id, { prompt: normalizedPrompt });
+            return { applied: true, target: 'node' };
+        }
+        if (Object.prototype.hasOwnProperty.call(settings, 'videoPrompt')) {
+            updateNodeSettings(targetNode.id, { videoPrompt: normalizedPrompt });
+            return { applied: true, target: 'node' };
+        }
+        if (Object.prototype.hasOwnProperty.call(settings, 'text')) {
+            updateNodeSettings(targetNode.id, { text: normalizedPrompt });
+            return { applied: true, target: 'node' };
+        }
+        if (Object.prototype.hasOwnProperty.call(settings, 'content')) {
+            updateNodeSettings(targetNode.id, { content: normalizedPrompt });
+            return { applied: true, target: 'node' };
+        }
+
+        return { applied: false };
+    };
+
+    const sendHistoryPromptSmart = async () => {
+        const item = historyContextMenu.item;
+        const promptText = String(item?.prompt || '').trim();
+        if (!promptText) {
+            showToast('该历史记录无可发送提示词', 'warning', 2800);
+            setHistoryContextMenu({ visible: false, x: 0, y: 0, item: null });
+            setHistorySendMenuOpen(false);
+            return;
+        }
+
+        if (activeShot.nodeId && activeShot.shotId) {
+            const activeNode = nodesMap.get(activeShot.nodeId);
+            if (activeNode?.type === 'storyboard-node') {
+                updateShot(activeShot.nodeId, activeShot.shotId, { prompt: promptText });
+                focusStoryboardShotCard(activeShot.nodeId, activeShot.shotId);
+                showToast('已发送提示词到激活镜头', 'success', 2200);
+                setHistoryContextMenu({ visible: false, x: 0, y: 0, item: null });
+                setHistorySendMenuOpen(false);
+                return;
+            }
+        }
+
+        const targetNodeId = resolvePrimarySelectedNodeId();
+        if (targetNodeId) {
+            const result = applyHistoryPromptToNode(targetNodeId, promptText);
+            if (result.applied) {
+                if (result.target === 'script') {
+                    showToast('已发送提示词到激活脚本', 'success', 2200);
+                } else {
+                    showToast('已发送提示词到激活节点', 'success', 2200);
+                }
+                setHistoryContextMenu({ visible: false, x: 0, y: 0, item: null });
+                setHistorySendMenuOpen(false);
+                return;
+            }
+        }
+
+        try {
+            await navigator.clipboard.writeText(promptText);
+            showToast('未检测到激活节点，提示词已复制到剪贴板', 'info', 2800);
+        } catch (error) {
+            console.error('复制历史提示词失败:', error);
+            showToast('复制提示词失败，请手动复制', 'error', 3000);
+        }
+        setHistoryContextMenu({ visible: false, x: 0, y: 0, item: null });
+        setHistorySendMenuOpen(false);
+    };
+
     const sendHistorySmart = async () => {
         const item = historyContextMenu.item;
         if (!item) return;
@@ -24424,7 +25470,7 @@ ${inputText.substring(0, 15000)} ... (截断)
             return;
         }
 
-        const targetId = selectedNodeIdRef.current || (selectedNodeIdsRef.current && [...selectedNodeIdsRef.current][0]);
+        const targetId = resolvePrimarySelectedNodeId();
         if (targetId) {
             const targetNode = nodesMap.get(targetId);
             if (targetNode) {
@@ -34929,6 +35975,15 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         <Send size={14} className="text-blue-500" /> 智能发送
                                     </button>
                                     <button
+                                        className={`w-full whitespace-nowrap text-left px-3 py-2 text-xs flex items-center gap-2 transition-colors ${theme === 'dark'
+                                            ? 'text-zinc-300 hover:bg-zinc-800'
+                                            : 'text-zinc-700 hover:bg-zinc-100'
+                                            }`}
+                                        onClick={sendHistoryPromptSmart}
+                                    >
+                                        <FileText size={14} className="text-amber-500" /> 发送提示词
+                                    </button>
+                                    <button
                                         className={`absolute right-2 top-2 p-1 rounded ${theme === 'dark'
                                             ? 'text-zinc-500 hover:text-zinc-200'
                                             : 'text-zinc-400 hover:text-zinc-700'
@@ -36401,6 +37456,10 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         key: 'API_KEY',
                                                         baseUrl: 'https://api.example.com'
                                                     },
+                                                    messages: [
+                                                        { role: 'system', content: '你是一名多模态AI助手。' },
+                                                        { role: 'user', content: [{ type: 'text', text: '示例提示词' }] }
+                                                    ],
                                                     imageUrl: 'https://example.com/image.png',
                                                     imageDataUrl: 'data:image/png;base64,PLACEHOLDER'
                                                 };
@@ -36443,12 +37502,25 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 timeoutMs: requestTemplateValue?.timeoutMs ?? '',
                                                 responseParser: requestTemplateValue?.responseParser || ''
                                             };
+                                            const transportModeValue = normalizeTransportMode(entry.transport);
+                                            const transportOptionsValue = normalizeTransportOptions(entry.transportOptions);
+                                            const transportOptionsDraft = libraryTransportOptionsDrafts[entry.id]
+                                                || JSON.stringify(transportOptionsValue, null, 2);
+                                            const capabilitiesValue = normalizeCapabilitySchema(entry.capabilities, entry.type);
+                                            const contractIssues = modelLibraryContractIssuesById[entry.id] || [];
+                                            const contractErrors = contractIssues.filter(issue => issue.level === 'error');
                                             const asyncConfigValue = normalizeAsyncConfig(entry.asyncConfig);
                                             const asyncConfigEnabled = !!asyncConfigValue?.enabled;
                                             const asyncConfigDraft = libraryAsyncConfigDrafts[entry.id] || (
                                                 asyncConfigValue
                                                     ? JSON.stringify(asyncConfigValue, null, 2)
                                                     : ASYNC_CONFIG_TEMPLATE_TEXT
+                                            );
+                                            const requestChainValue = normalizeRequestChain(entry.requestChain);
+                                            const requestChainDraft = libraryRequestChainDrafts[entry.id] || (
+                                                requestChainValue
+                                                    ? JSON.stringify(requestChainValue, null, 2)
+                                                    : REQUEST_CHAIN_TEMPLATE_TEXT
                                             );
                                             const isAsyncPreviewOpen = libraryAsyncPreviewModels.has(entry.id);
                                             const isRequestTemplateCollapsed = isLibrarySectionCollapsed(entry.id, 'request-template');
@@ -36490,7 +37562,13 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     {isEditing ? (
                                                                         <select
                                                                             value={entry.type || 'Chat'}
-                                                                            onChange={(e) => updateModelLibraryEntry(entry.id, { type: e.target.value })}
+                                                                            onChange={(e) => {
+                                                                                const nextType = e.target.value;
+                                                                                updateModelLibraryEntry(entry.id, {
+                                                                                    type: nextType,
+                                                                                    capabilities: normalizeCapabilitySchema(entry.capabilities, nextType)
+                                                                                });
+                                                                            }}
                                                                             className={`text-[9px] px-1 py-0.5 rounded border outline-none ${theme === 'dark'
                                                                                 ? 'bg-zinc-900 border-zinc-700 text-zinc-300'
                                                                                 : 'bg-white border-zinc-300 text-zinc-700'
@@ -36517,6 +37595,11 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
                                                                 {t('系统调用模型ID：')}{entry.modelName || entry.id}
                                                             </div>
+                                                            {contractIssues.length > 0 && (
+                                                                <div className={`text-[9px] ${contractErrors.length > 0 ? 'text-amber-500' : 'text-blue-500'}`}>
+                                                                    {t('配置校验：')} {contractErrors.length > 0 ? t('存在阻断项') : t('存在提示项')} · {contractIssues[0]?.message}
+                                                                </div>
+                                                            )}
                                                         </div>
                                                         <div className="flex items-center gap-1">
                                                             <button
@@ -37483,6 +38566,104 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     </div>
                                                                 </div>
                                                                 <div className="grid grid-cols-12 gap-2 mt-2">
+                                                                    <div className="col-span-4 space-y-1">
+                                                                        <label className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('Transport')}</label>
+                                                                        <select
+                                                                            value={transportModeValue}
+                                                                            onChange={(e) => updateModelLibraryEntry(entry.id, { transport: normalizeTransportMode(e.target.value) })}
+                                                                            disabled={!isEditing}
+                                                                            className={`w-full text-[10px] rounded px-2 py-1 border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-900 border-zinc-800 text-zinc-300'
+                                                                                : 'bg-white border-zinc-300 text-zinc-900'
+                                                                                }`}
+                                                                        >
+                                                                            <option value={TRANSPORT_HTTP_JSON}>http-json</option>
+                                                                            <option value={TRANSPORT_HTTP_SSE}>http-sse</option>
+                                                                            <option value={TRANSPORT_WS_STREAM}>ws-stream</option>
+                                                                        </select>
+                                                                    </div>
+                                                                    <div className="col-span-8 space-y-1">
+                                                                        <label className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('Transport Options（JSON）')}</label>
+                                                                        <textarea
+                                                                            value={transportOptionsDraft}
+                                                                            onChange={(e) => setLibraryTransportOptionsDrafts(prev => ({ ...prev, [entry.id]: e.target.value }))}
+                                                                            disabled={!isEditing}
+                                                                            className={`w-full h-20 text-[9px] rounded px-2 py-1 border outline-none ${theme === 'dark'
+                                                                                ? 'bg-zinc-900 border-zinc-800 text-zinc-200'
+                                                                                : 'bg-white border-zinc-300 text-zinc-800'
+                                                                                }`}
+                                                                        />
+                                                                        <div className="flex items-center justify-end">
+                                                                            <button
+                                                                                onClick={() => {
+                                                                                    try {
+                                                                                        const parsed = transportOptionsDraft ? JSON.parse(transportOptionsDraft) : {};
+                                                                                        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                                                                                            throw new Error('Transport Options 必须是对象');
+                                                                                        }
+                                                                                        updateModelLibraryEntry(entry.id, { transportOptions: normalizeTransportOptions(parsed) });
+                                                                                        setLibraryTransportOptionsDrafts(prev => {
+                                                                                            const { [entry.id]: _removed, ...rest } = prev;
+                                                                                            return rest;
+                                                                                        });
+                                                                                        showToast('Transport 配置已保存', 'success', 2000);
+                                                                                    } catch (e) {
+                                                                                        showToast('Transport Options JSON 格式无效', 'error', 2000);
+                                                                                    }
+                                                                                }}
+                                                                                disabled={!isEditing}
+                                                                                className={`px-2 py-1 rounded text-[9px] ${theme === 'dark'
+                                                                                    ? 'bg-zinc-700 text-zinc-200 hover:bg-zinc-600'
+                                                                                    : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300'
+                                                                                    } ${!isEditing ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                                                            >
+                                                                                {t('保存 Transport')}
+                                                                            </button>
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                                <div className="mt-2 space-y-1">
+                                                                    <label className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('Capabilities')}</label>
+                                                                    <div className="flex flex-wrap items-center gap-3">
+                                                                        {[
+                                                                            { key: 'supportsMultipart', label: 'multipart' },
+                                                                            { key: 'supportsRequestChain', label: 'requestChain' },
+                                                                            { key: 'supportsSSE', label: 'sse' },
+                                                                            { key: 'supportsWS', label: 'ws' },
+                                                                            { key: 'supportsTools', label: 'tools' }
+                                                                        ].map((cap) => (
+                                                                            <label key={cap.key} className={`flex items-center gap-1 text-[9px] ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>
+                                                                                <input
+                                                                                    type="checkbox"
+                                                                                    checked={!!capabilitiesValue?.[cap.key]}
+                                                                                    onChange={(e) => {
+                                                                                        updateModelLibraryEntry(entry.id, {
+                                                                                            capabilities: {
+                                                                                                ...capabilitiesValue,
+                                                                                                [cap.key]: e.target.checked
+                                                                                            }
+                                                                                        });
+                                                                                    }}
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                                <span>{cap.label}</span>
+                                                                            </label>
+                                                                        ))}
+                                                                    </div>
+                                                                </div>
+                                                                {contractIssues.length > 0 && (
+                                                                    <div className={`mt-2 rounded px-2 py-1 text-[9px] ${contractErrors.length > 0
+                                                                        ? 'bg-amber-500/15 text-amber-500'
+                                                                        : theme === 'dark'
+                                                                            ? 'bg-blue-500/15 text-blue-300'
+                                                                            : 'bg-blue-50 text-blue-600'
+                                                                        }`}>
+                                                                        {contractIssues.map((issue, idx) => (
+                                                                            <div key={`${entry.id}-issue-${idx}`}>[{issue.level}] {issue.message}</div>
+                                                                        ))}
+                                                                    </div>
+                                                                )}
+                                                                <div className="grid grid-cols-12 gap-2 mt-2">
                                                                     <div className="col-span-6 space-y-1">
                                                                         <label className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('请求头（JSON）')}</label>
                                                                         <textarea
@@ -37793,6 +38974,74 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                     </>
                                                                 )}
                                                             </div>
+                                                            <div className={`rounded-md border p-2 mt-3 ${theme === 'dark'
+                                                                ? 'bg-zinc-950/60 border-zinc-800'
+                                                                : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'
+                                                                }`}>
+                                                                <div className="flex items-center justify-between mb-2">
+                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
+                                                                        {t('Request Chain V1（upload -> extract -> chat）')}
+                                                                    </div>
+                                                                </div>
+                                                                <textarea
+                                                                    value={requestChainDraft}
+                                                                    onChange={(e) => setLibraryRequestChainDrafts(prev => ({ ...prev, [entry.id]: e.target.value }))}
+                                                                    disabled={!isEditing}
+                                                                    className={`w-full h-40 text-[9px] rounded px-2 py-1 border outline-none ${theme === 'dark'
+                                                                        ? 'bg-zinc-900 border-zinc-800 text-zinc-200'
+                                                                        : 'bg-white border-zinc-300 text-zinc-800'
+                                                                        }`}
+                                                                />
+                                                                <div className="flex items-center justify-between mt-2">
+                                                                    <div className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
+                                                                        Step 类型：`http` / `transform`，支持 extract 变量回填
+                                                                    </div>
+                                                                    <div className="flex items-center gap-2">
+                                                                        <button
+                                                                            onClick={() => {
+                                                                                try {
+                                                                                    const parsed = requestChainDraft ? JSON.parse(requestChainDraft) : {};
+                                                                                    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                                                                                        throw new Error('Request Chain 必须是对象');
+                                                                                    }
+                                                                                    const normalized = normalizeRequestChain(parsed);
+                                                                                    updateModelLibraryEntry(entry.id, { requestChain: normalized });
+                                                                                    setLibraryRequestChainDrafts(prev => {
+                                                                                        const { [entry.id]: _removed, ...rest } = prev;
+                                                                                        return rest;
+                                                                                    });
+                                                                                    showToast('Request Chain 已保存', 'success', 2000);
+                                                                                } catch (e) {
+                                                                                    showToast('Request Chain JSON 格式无效', 'error', 2000);
+                                                                                }
+                                                                            }}
+                                                                            disabled={!isEditing}
+                                                                            className={`px-2 py-1 rounded text-[9px] ${theme === 'dark'
+                                                                                ? 'bg-zinc-700 text-zinc-200 hover:bg-zinc-600'
+                                                                                : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300'
+                                                                                } ${!isEditing ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                                                        >
+                                                                            {t('保存链路')}
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => {
+                                                                                updateModelLibraryEntry(entry.id, { requestChain: null });
+                                                                                setLibraryRequestChainDrafts(prev => {
+                                                                                    const { [entry.id]: _removed, ...rest } = prev;
+                                                                                    return rest;
+                                                                                });
+                                                                            }}
+                                                                            disabled={!isEditing}
+                                                                            className={`px-2 py-1 rounded text-[9px] ${theme === 'dark'
+                                                                                ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'
+                                                                                : 'bg-zinc-100 text-zinc-500 hover:bg-zinc-200'
+                                                                                } ${!isEditing ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                                                        >
+                                                                            {t('重置')}
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
                                                             {isPreviewOpen && (
                                                                 <div className={`rounded-md border p-2 ${theme === 'dark'
                                                                     ? 'bg-zinc-950/60 border-zinc-800'
@@ -37956,7 +39205,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                             </div>
                                                                         </div>
                                                                         <div className={`text-[9px] mb-1 ${theme === 'dark' ? 'text-zinc-600' : 'text-zinc-500'}`}>
-                                                                            模板状态：{requestTemplateEnabled ? t('已启用') : t('未启用')} · BodyType: {requestTemplateValue?.bodyType || 'json'}
+                                                                            模板状态：{requestTemplateEnabled ? t('已启用') : t('未启用')} · BodyType: {requestTemplateValue?.bodyType || 'json'} · Transport: {transportModeValue}
                                                                         </div>
                                                                         {isRequestPreviewEditing ? (
                                                                             <div className="space-y-2">
